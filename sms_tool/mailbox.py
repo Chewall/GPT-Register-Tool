@@ -494,6 +494,8 @@ def _poll_luckmail_token_otp(mailbox, timeout=300, issued_after_unix=0):
     deadline = time.time() + timeout
     interval = _otp_poll_interval()
     seen_message_id = getattr(mailbox, "seen_message_id", "")
+    last_error_text = ""
+    last_error_at = 0
     while time.time() < deadline:
         try:
             body = _luckmail_token_code(mailbox)
@@ -509,7 +511,12 @@ def _poll_luckmail_token_otp(mailbox, timeout=300, issued_after_unix=0):
             if code:
                 print(" old-code", end="", flush=True)
         except Exception as e:
-            print(f"[luckmail token poll error: {e}]")
+            error_text = str(e)
+            now = time.time()
+            if error_text != last_error_text or now - last_error_at >= 30:
+                print(f"[luckmail token poll error: {error_text}]")
+                last_error_text = error_text
+                last_error_at = now
         print(".", end="", flush=True)
         time.sleep(interval)
     print(" timeout")

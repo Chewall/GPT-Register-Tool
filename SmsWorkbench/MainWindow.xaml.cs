@@ -183,6 +183,7 @@ namespace SmsWorkbench
             if (PurchaseEmailTypeText.Length == 0) PurchaseEmailTypeText = "ms_imap";
             PurchaseDomainText = ConfigString("email_registration", "luckmail_purchase_domain");
             if (PurchaseDomainText.Length == 0) PurchaseDomainText = "outlook.com";
+            ProxyText = ConfigString("proxy", "default");
             RefreshPools();
         }
 
@@ -837,17 +838,21 @@ namespace SmsWorkbench
             Grid.SetColumn(labelBlock, 0);
             parent.Children.Add(labelBlock);
 
+            bool longValue = label.Contains("链接") || (value ?? "").StartsWith("http", StringComparison.OrdinalIgnoreCase);
             var valueBox = new TextBox
             {
                 Text = value ?? "",
                 Margin = new Thickness(0, 4, 10, 4),
                 IsReadOnly = true,
-                BorderThickness = new Thickness(0),
+                BorderThickness = longValue ? new Thickness(1) : new Thickness(0),
                 Background = (System.Windows.Media.Brush)FindResource("PanelBg"),
                 Foreground = (System.Windows.Media.Brush)FindResource("TextMain"),
-                TextWrapping = TextWrapping.NoWrap,
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
-                VerticalScrollBarVisibility = ScrollBarVisibility.Disabled
+                TextWrapping = longValue ? TextWrapping.Wrap : TextWrapping.NoWrap,
+                HorizontalScrollBarVisibility = longValue ? ScrollBarVisibility.Disabled : ScrollBarVisibility.Auto,
+                VerticalScrollBarVisibility = longValue ? ScrollBarVisibility.Auto : ScrollBarVisibility.Disabled,
+                MinHeight = longValue ? 58 : 0,
+                MaxHeight = longValue ? 96 : double.PositiveInfinity,
+                Padding = longValue ? new Thickness(6, 4, 6, 4) : new Thickness(0)
             };
             Grid.SetRow(valueBox, row);
             Grid.SetColumn(valueBox, 1);
@@ -931,6 +936,7 @@ namespace SmsWorkbench
             EnsureConfigFile(path);
             var config = ReadJsonObject(path);
             var email = GetSection(config, "email_registration");
+            var proxy = GetSection(config, "proxy");
             var paypal = GetSection(config, "paypal");
             var storage = GetSection(config, "storage");
             var output = GetSection(config, "output");
@@ -964,6 +970,7 @@ namespace SmsWorkbench
             AddConfigField(form, fields, row++, "邮箱域名", "luckmail_purchase_domain", GetString(email, "luckmail_purchase_domain"));
             AddConfigField(form, fields, row++, "OTP轮询间隔秒", "otp_poll_interval", GetString(email, "otp_poll_interval"));
             AddConfigField(form, fields, row++, "邮箱池文件", "token_file", GetString(email, "token_file"));
+            AddConfigField(form, fields, row++, "默认代理", "default_proxy", GetString(proxy, "default"));
             AddConfigField(form, fields, row++, "PayPal代理", "paypal_proxy", FirstListValue(paypal, "proxies"));
             AddConfigField(form, fields, row++, "Session目录", "output_directory", GetString(output, "directory"));
             AddConfigField(form, fields, row++, "SQLite路径", "sqlite_path", GetString(storage, "sqlite_path"));
@@ -990,10 +997,12 @@ namespace SmsWorkbench
                 email["luckmail_purchase_domain"] = fields["luckmail_purchase_domain"].Text.Trim();
                 email["otp_poll_interval"] = fields["otp_poll_interval"].Text.Trim();
                 email["token_file"] = fields["token_file"].Text.Trim();
+                proxy["default"] = fields["default_proxy"].Text.Trim();
                 paypal["proxies"] = new List<object> { fields["paypal_proxy"].Text.Trim() };
                 output["directory"] = fields["output_directory"].Text.Trim();
                 storage["sqlite_path"] = fields["sqlite_path"].Text.Trim();
                 config["email_registration"] = email;
+                config["proxy"] = proxy;
                 config["paypal"] = paypal;
                 config["output"] = output;
                 config["storage"] = storage;
@@ -1001,6 +1010,7 @@ namespace SmsWorkbench
                 PurchaseProjectText = fields["luckmail_purchase_project_code"].Text.Trim();
                 PurchaseEmailTypeText = fields["luckmail_purchase_email_type"].Text.Trim();
                 PurchaseDomainText = fields["luckmail_purchase_domain"].Text.Trim();
+                ProxyText = fields["default_proxy"].Text.Trim();
                 Log("配置已保存。");
                 dialog.Close();
             };
@@ -1143,7 +1153,8 @@ namespace SmsWorkbench
         private string GetMailboxTokenFile()
         {
             string configured = ConfigString("email_registration", "token_file");
-            return configured.Length > 0 ? Environment.ExpandEnvironmentVariables(configured) : Path.Combine(rootDir, "mailbox_tokens.txt");
+            string expanded = configured.Length > 0 ? Environment.ExpandEnvironmentVariables(configured) : "mailbox_tokens.txt";
+            return Path.IsPathRooted(expanded) ? expanded : Path.Combine(rootDir, expanded);
         }
 
         private string ConfigString(string section, string key)
@@ -1344,10 +1355,16 @@ namespace SmsWorkbench
                 }
                 if (Path.GetExtension(path).Length > 0)
                 {
+                    string directory = Path.GetDirectoryName(Path.GetFullPath(path)) ?? rootDir;
+                    Directory.CreateDirectory(directory);
                     string example = Path.Combine(rootDir, "config.example.json");
                     if (Path.GetFileName(path).Equals("config.json", StringComparison.OrdinalIgnoreCase) && File.Exists(example))
                     {
                         File.Copy(example, path);
+                    }
+                    else if (!File.Exists(path))
+                    {
+                        File.WriteAllText(path, "", Encoding.UTF8);
                     }
                     Process.Start(new ProcessStartInfo("notepad.exe", path) { UseShellExecute = true });
                     return;

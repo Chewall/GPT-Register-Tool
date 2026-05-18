@@ -32,7 +32,8 @@ except ImportError:
 # ──────────────────────────── 常量 ────────────────────────────
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+DEFAULT_CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.json")
 
 DEFAULT_STRIPE_PK = (
     "pk_live_51HOrSwC6h1nxGoI3lTAgRjYVrz4dU3fVOabyCcKR3pbEJguCVAlqCxdxCUvoRh1XWwRac"
@@ -86,6 +87,24 @@ def _build_chatgpt_session(access_token: str) -> Any:
         s.headers["Authorization"] = f"Bearer {access_token}"
     s.headers["Cookie"] = f"oai-did={device_id}; __Secure-next-auth.session-token=dummy"
     return s
+
+
+def _normalize_proxy(proxy: Any) -> str:
+    value = str(proxy or "").strip()
+    if value.lower() in ("", "none", "null", "direct", "no_proxy", "nopoxy"):
+        return ""
+    return value
+
+
+def _set_session_proxy(session: Any, proxy: str):
+    proxy = _normalize_proxy(proxy)
+    session.proxies = {"http": proxy, "https": proxy} if proxy else {}
+
+
+def _stage_proxy(paypal_cfg: dict[str, Any], stage: str, fallback_proxy: str) -> str:
+    stages = paypal_cfg.get("stage_proxies") if isinstance(paypal_cfg.get("stage_proxies"), dict) else {}
+    fallback = _normalize_proxy(stages.get("default") or fallback_proxy)
+    return _normalize_proxy(stages.get(stage, fallback))
 
 
 # ──────────────────────────── Token 解析 ────────────────────────────
@@ -152,6 +171,77 @@ def _extract_checkout_context(data: dict[str, Any]) -> tuple[str, str, str]:
     return cs_id, processor_entity, checkout_url
 
 
+def _amount_to_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _amount_at(data: dict[str, Any], *path: str) -> Any:
+    cur: Any = data
+    for part in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _collect_tax_amounts(value: Any, allow_scalar: bool = True) -> list[int]:
+    amounts: list[int] = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            key_lower = str(key).lower()
+            if key_lower in ("amount", "tax_amount", "taxamount"):
+                direct = _amount_to_int(nested)
+                if direct is not None:
+                    amounts.append(direct)
+                continue
+            if isinstance(nested, (dict, list)):
+                amounts.extend(_collect_tax_amounts(nested, allow_scalar=False))
+    elif isinstance(value, list):
+        for item in value:
+            amounts.extend(_collect_tax_amounts(item, allow_scalar=False))
+    elif allow_scalar:
+        direct = _amount_to_int(value)
+        if direct is not None:
+            amounts.append(direct)
+    return amounts
+
+
+def _zero_due_check(init_data: dict[str, Any]) -> dict[str, Any]:
+    amount_candidates = {
+        "total_summary.due": _amount_at(init_data, "total_summary", "due"),
+        "total_summary.total": _amount_at(init_data, "total_summary", "total"),
+        "invoice.amount_due": _amount_at(init_data, "invoice", "amount_due"),
+        "invoice.total": _amount_at(init_data, "invoice", "total"),
+    }
+    amounts = {key: amount for key, raw in amount_candidates.items() if (amount := _amount_to_int(raw)) is not None}
+
+    tax_candidates = [
+        _amount_at(init_data, "total_summary", "tax"),
+        _amount_at(init_data, "total_summary", "tax_amount"),
+        _amount_at(init_data, "total_summary", "total_tax_amounts"),
+        _amount_at(init_data, "invoice", "tax"),
+        _amount_at(init_data, "invoice", "tax_amount"),
+        _amount_at(init_data, "invoice", "total_tax_amounts"),
+    ]
+    tax_amounts: list[int] = []
+    for candidate in tax_candidates:
+        tax_amounts.extend(_collect_tax_amounts(candidate))
+
+    amount_zero = bool(amounts) and all(amount == 0 for amount in amounts.values())
+    tax_zero = all(amount == 0 for amount in tax_amounts)
+    return {
+        "ok": amount_zero and tax_zero,
+        "amounts": amounts,
+        "tax_amounts": tax_amounts,
+        "tax_after_zero": tax_zero,
+    }
+
+
 # ──────────────────────────── 核心流程 ────────────────────────────
 
 
@@ -161,21 +251,32 @@ def _try_paypal_link(
     region: dict,
     proxy: str,
 ) -> dict[str, Any] | None:
+    paypal_cfg = cfg.get("paypal") or {}
+    checkout_proxy = _stage_proxy(paypal_cfg, "checkout", proxy)
+    stripe_init_proxy = _stage_proxy(paypal_cfg, "stripe_init", proxy)
+    stripe_pm_proxy = _stage_proxy(paypal_cfg, "payment_method", stripe_init_proxy)
+    stripe_confirm_proxy = _stage_proxy(paypal_cfg, "confirm", "")
     stripe_pk = (cfg.get("stripe") or {}).get("publishable_key") or DEFAULT_STRIPE_PK
     runtime_cfg = cfg.get("runtime") or {}
     runtime_version = runtime_cfg.get("version") or "fed52f3bc6"
 
     # 构建 ChatGPT session
     cs = _build_chatgpt_session(access_token)
-    cs.proxies = {"http": proxy, "https": proxy}
+    _set_session_proxy(cs, checkout_proxy)
 
     # 构建 Stripe 外部 session
-    ext = _new_session()
-    ext.proxies = {"http": proxy, "https": proxy}
-    ext.headers.update({
+    stripe_init = _new_session()
+    _set_session_proxy(stripe_init, stripe_init_proxy)
+    stripe_init.headers.update({
         "User-Agent": cs.headers.get("User-Agent", ""),
         "Accept-Language": "en-US,en;q=0.9",
     })
+    stripe_pm = _new_session()
+    _set_session_proxy(stripe_pm, stripe_pm_proxy)
+    stripe_pm.headers.update(stripe_init.headers)
+    stripe_confirm = _new_session()
+    _set_session_proxy(stripe_confirm, stripe_confirm_proxy)
+    stripe_confirm.headers.update(stripe_init.headers)
 
     # ── Step 1: ChatGPT checkout ──
     body: dict[str, Any] = {
@@ -193,7 +294,10 @@ def _try_paypal_link(
         },
     }
 
-    print(f"[pp] checkout: region={region['country']} promo=plus-1-month-free proxy={proxy}", file=sys.stderr)
+    print(
+        f"[pp] checkout: region={region['country']} promo=plus-1-month-free proxy={checkout_proxy or 'DIRECT'}",
+        file=sys.stderr,
+    )
 
     r = cs.post(
         "https://chatgpt.com/backend-api/payments/checkout",
@@ -232,7 +336,8 @@ def _try_paypal_link(
             "checkout_manual_approval_preview=v1"
         ),
     }
-    r1 = ext.post(
+    print(f"[pp] stripe init: proxy={stripe_init_proxy or 'DIRECT'}", file=sys.stderr)
+    r1 = stripe_init.post(
         f"https://api.stripe.com/v1/payment_pages/{cs_id}/init",
         data=init_body, timeout=DEFAULT_TIMEOUT,
     )
@@ -248,14 +353,30 @@ def _try_paypal_link(
     currency = (init_data.get("invoice") or {}).get("currency") or region["currency"]
     pm_types = init_data.get("payment_method_types") or []
     has_paypal = any("paypal" in (p or "").lower() for p in pm_types)
+    zero_check = _zero_due_check(init_data)
 
     expected_amount = "0"
-    if due is not None:
-        expected_amount = str(due)
-    elif amount_due is not None:
-        expected_amount = str(amount_due)
 
-    print(f"[pp] init: due={due} amount_due={amount_due} currency={currency} pm_types={pm_types}", file=sys.stderr)
+    print(
+        f"[pp] init: due={due} amount_due={amount_due} currency={currency} "
+        f"amounts={zero_check['amounts']} tax_amounts={zero_check['tax_amounts']} pm_types={pm_types}",
+        file=sys.stderr,
+    )
+
+    if not zero_check["ok"]:
+        return {
+            "ok": False,
+            "error": (
+                "Stripe checkout is not zero due after tax: "
+                f"expected_amount=0 amounts={zero_check['amounts']} tax_amounts={zero_check['tax_amounts']}"
+            ),
+            "region": region["label"],
+            "due": due,
+            "amount_due": amount_due,
+            "expected_amount": expected_amount,
+            "zero_due_verified": False,
+            "tax_after_zero": zero_check["tax_after_zero"],
+        }
 
     if not has_paypal:
         return {"ok": False, "error": f"Stripe 不支持 PayPal（可用: {pm_types}）", "region": region["label"]}
@@ -297,7 +418,8 @@ def _try_paypal_link(
         ),
     }
 
-    r2 = ext.post(
+    print(f"[pp] pm create: proxy={stripe_pm_proxy or 'DIRECT'}", file=sys.stderr)
+    r2 = stripe_pm.post(
         "https://api.stripe.com/v1/payment_methods",
         data=pm_body, timeout=DEFAULT_TIMEOUT,
     )
@@ -371,7 +493,8 @@ def _try_paypal_link(
     if runtime_cfg.get("rv_timestamp"):
         confirm_body["rv_timestamp"] = runtime_cfg["rv_timestamp"]
 
-    r3 = ext.post(
+    print(f"[pp] confirm: proxy={stripe_confirm_proxy or 'DIRECT'}", file=sys.stderr)
+    r3 = stripe_confirm.post(
         f"https://api.stripe.com/v1/payment_pages/{cs_id}/confirm",
         data=confirm_body, timeout=DEFAULT_TIMEOUT,
     )
@@ -394,7 +517,7 @@ def _try_paypal_link(
         if na.get("type") == "redirect_to_url":
             redirect_url = (na.get("redirect_to_url") or {}).get("url", "")
 
-    promo_applied = due == 0 or amount_due == 0
+    promo_applied = bool(zero_check["ok"])
     coupon_state = f"eligible (0 {currency.upper()})" if promo_applied else f"not_eligible ({amount_due or due} {currency.upper()})"
 
     return {
@@ -405,11 +528,22 @@ def _try_paypal_link(
         "due": due,
         "amount_due": amount_due,
         "currency": currency,
+        "expected_amount": expected_amount,
+        "zero_due_verified": True,
+        "tax_after_zero": zero_check["tax_after_zero"],
+        "zero_due_amounts": zero_check["amounts"],
+        "tax_amounts": zero_check["tax_amounts"],
         "payment_method_types": pm_types,
         "has_paypal": has_paypal,
         "coupon_state": coupon_state,
         "region": region["label"],
         "proxy": proxy,
+        "stage_proxies": {
+            "checkout": checkout_proxy or "DIRECT",
+            "stripe_init": stripe_init_proxy or "DIRECT",
+            "payment_method": stripe_pm_proxy or "DIRECT",
+            "confirm": stripe_confirm_proxy or "DIRECT",
+        },
     }
 
 
@@ -424,20 +558,25 @@ def generate_pp_link(access_token: str) -> dict[str, Any]:
 
     paypal_cfg = cfg.get("paypal") or {}
     proxies = paypal_cfg.get("proxies") or PP_PROXIES
+    max_checkout_retries = max(1, int(paypal_cfg.get("max_checkout_retries", 3)))
 
     last_err = None
     for region in BILLING_REGIONS:
         for proxy in proxies:
-            try:
-                result = _try_paypal_link(access_token, cfg, region, proxy)
-                if result and result.get("ok"):
-                    return result
-                if result and result.get("error"):
-                    last_err = result["error"]
-            except Exception as e:
-                last_err = str(e)
-                print(f"[pp] attempt failed: {region['label']}+{proxy}: {last_err}", file=sys.stderr)
-                continue
+            for attempt in range(1, max_checkout_retries + 1):
+                try:
+                    if attempt > 1:
+                        print(f"[pp] retry checkout: attempt={attempt}/{max_checkout_retries}", file=sys.stderr)
+                    result = _try_paypal_link(access_token, cfg, region, proxy)
+                    if result and result.get("ok"):
+                        result["checkout_attempt"] = attempt
+                        return result
+                    if result and result.get("error"):
+                        last_err = result["error"]
+                except Exception as e:
+                    last_err = str(e)
+                    print(f"[pp] attempt failed: {region['label']}+{proxy}: {last_err}", file=sys.stderr)
+                    continue
 
     return {"ok": False, "error": f"所有尝试均失败，最后错误: {last_err}"}
 

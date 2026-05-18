@@ -8,6 +8,7 @@ import webbrowser
 
 from .config import CFG
 from .mailbox import _load_mailbox_pool, _luckmail_enabled
+from .paypal_auto import auto_pay
 from .paypal_links import regenerate_paypal_link
 from .paths import output_dir
 from .registration import _build_session_file, run_batch, run_email
@@ -40,11 +41,20 @@ def main():
     parser.add_argument("--open-paypal-link", action="store_true", help="Open saved PayPal payment link for --email")
     parser.add_argument("--mark-paypal-status", default=None, help="Update saved PayPal status for --email")
     parser.add_argument("--regenerate-paypal-link", action="store_true", help="Regenerate PayPal link for --email and update SQLite/session JSON")
-    parser.add_argument("--refresh-session", action="store_true", help="Open an interactive browser and refresh ChatGPT auth session")
+    parser.add_argument("--refresh-session", action="store_true", help="Refresh ChatGPT auth session with protocol requests")
     parser.add_argument("--session-file", default=None, help="Session JSON path for --refresh-session or --regenerate-paypal-link")
     parser.add_argument("--refresh-timeout", type=int, default=300, help="Seconds to wait for interactive auth refresh")
-    parser.add_argument("--headless-refresh", action="store_true", help="Run refresh browser headless; visible browser is default")
+    parser.add_argument("--browser-refresh-session", action="store_true", help="Use the old browser-based refresh flow")
+    parser.add_argument("--headless-refresh", action="store_true", help="Run browser refresh headless; visible browser is default")
+    parser.add_argument("--auto-pay", action="store_true", help="Automate PayPal payment (reverse protocol first, browser fallback)")
+    parser.add_argument("--auto-pay-reverse-only", action="store_true", help="Use reverse protocol only, no browser fallback")
+    parser.add_argument("--auto-pay-headless", action="store_true", help="Run auto-pay browser headless")
+    parser.add_argument("--auto-pay-timeout", type=int, default=180, help="Seconds to wait for auto-pay completion")
+    parser.add_argument("--batch-auto-pay", action="store_true", help="Run auto-pay for all pending accounts in SQLite")
+    parser.add_argument("--batch-auto-pay-limit", type=int, default=0, help="Max accounts to process in batch (0=all)")
     args = parser.parse_args()
+    if not args.proxy:
+        args.proxy = ((CFG.get("proxy") or {}).get("default") or "").strip() or None
 
     base_dir = args.output_dir or str(output_dir(CFG))
     if args.rebuild_sqlite:
@@ -65,6 +75,12 @@ def main():
         return
     if args.refresh_session:
         _refresh_session(args)
+        return
+    if args.auto_pay or args.auto_pay_reverse_only:
+        _auto_pay(args)
+        return
+    if args.batch_auto_pay:
+        _batch_auto_pay(args)
         return
 
     pipeline_started = time.time()
@@ -175,6 +191,8 @@ def _refresh_session(args):
         session_file=args.session_file or "",
         timeout=args.refresh_timeout,
         headless=args.headless_refresh,
+        browser=args.browser_refresh_session,
+        proxy=args.proxy,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -187,4 +205,102 @@ def _regenerate_paypal_link(args):
     result = regenerate_paypal_link(email=email, session_file=args.session_file or "")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
+def _auto_pay(args):
+    """Run automated PayPal payment for a ChatGPT account."""
+    email = (args.email or "").strip()
+    session_file = (args.session_file or "").strip()
+    if not email and not session_file:
+        print("[Error] --email or --session-file is required with --auto-pay")
+        return
 
+    reverse_only = getattr(args, 'auto_pay_reverse_only', False)
+    mode = "reverse-only" if reverse_only else "reverse+browser"
+    print(f"[*] Starting auto-pay ({mode}) for: {email or session_file}")
+    result = auto_pay(
+        email=email,
+        session_file=session_file,
+        proxy=args.proxy,
+        headless=args.auto_pay_headless,
+        timeout=args.auto_pay_timeout,
+        reverse_only=reverse_only,
+    )
+
+    if result.get("ok"):
+        print(f"\n[*] Auto-pay completed successfully!")
+        print(f"    Email: {result.get('email', '')}")
+        print(f"    Alias: {result.get('alias_email', '')}")
+        print(f"    Card: ****{result.get('card_last4', '')}")
+        print(f"    Status: {result.get('paypal_status', '')}")
+        print(f"    Session: {result.get('json_path', '')}")
+    else:
+        print(f"\n[!] Auto-pay failed: {result.get('error', 'unknown error')}")
+        if result.get("failed_step"):
+            print(f"    Failed step: {result['failed_step']}")
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+def _batch_auto_pay(args):
+    """Run automated PayPal payment for all pending accounts."""
+    from .storage import list_paypal_accounts
+
+    limit = max(0, int(args.batch_auto_pay_limit or 0))
+
+    # Get accounts with pending PayPal status
+    all_accounts = list_paypal_accounts()
+    pending = [
+        row for row in all_accounts
+        if row.get("paypal_status") in ("", "missing", "failed", "link_ready")
+        and row.get("access_token")
+    ]
+
+    if limit > 0:
+        pending = pending[:limit]
+
+    if not pending:
+        print("[*] No pending accounts found for auto-pay")
+        return
+
+    total = len(pending)
+    print(f"[*] Batch auto-pay: {total} account(s) to process")
+    print("=" * 60)
+
+    results = []
+    for i, row in enumerate(pending, 1):
+        email = row.get("email", "")
+        print(f"[{i}/{total}] Processing: {email}")
+        print("-" * 40)
+
+        result = auto_pay(
+            email=email,
+            proxy=args.proxy,
+            headless=args.auto_pay_headless,
+            timeout=args.auto_pay_timeout,
+        )
+        results.append(result)
+
+        if result.get("ok"):
+            print(f"[OK] {email} - Payment completed")
+        else:
+            print(f"[FAIL] {email} - {result.get('error', 'unknown')}")
+
+        # Small delay between accounts
+        if i < total:
+            time.sleep(5)
+
+    # Summary
+    print("" + "=" * 60)
+
+    print("Batch Auto-Pay Summary:")
+    print("=" * 60)
+    ok_count = sum(1 for r in results if r.get("ok"))
+    fail_count = total - ok_count
+    print(f"  Total: {total}")
+    print(f"  Success: {ok_count}")
+    print(f"  Failed: {fail_count}")
+
+    if fail_count > 0:
+        print("Failed accounts:")
+
+        for r in results:
+            if not r.get("ok"):
+                print(f"  - {r.get('email', 'unknown')}: {r.get('error', 'unknown')}")

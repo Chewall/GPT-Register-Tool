@@ -74,5 +74,5 @@ python .\chatgpt_phone_reg.py --buy-luckmail-mailbox --proxy socks5h://127.0.0.1
 - CLI 通过 `--email <account> --open-paypal-link` 打开指定账号的 PayPal 链接，后续授权或支付由人工在浏览器完成。
 - CLI 通过 `--email <account> --regenerate-paypal-link` 使用现有 `access_token` 重新生成短时 PayPal 授权链接，并回写 SQLite 和 session JSON。
 - 人工完成后用 `--email <account> --mark-paypal-status completed` 标记 SQLite 和 session JSON。
-- `--email <account> --refresh-session` 打开可见 Playwright 浏览器，人工完成登录/授权后轮询 `https://chatgpt.com/api/auth/session`，回写新的 `access_token`、`auth_session`、`oauth_refresh_token`、`refresh_token_status`。
+- `--email <account> --refresh-session` 打开可见 CloakBrowser 浏览器，人工完成登录/授权后轮询 `https://chatgpt.com/api/auth/session`，回写新的 `access_token`、`auth_session`、`oauth_refresh_token`、`refresh_token_status`。
 - WPF 侧对应按钮为“打开支付链接”“重新生成链接”“标记支付完成”“刷新Session”，列表中展示支付状态和 refresh 状态。

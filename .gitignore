@@ -6,6 +6,7 @@ sessions/
 runtime/
 .dotnet/
 sms_tool/sentinel_cache.json
+mailbox_tokens.txt
 
 __pycache__/
 *.py[cod]

@@ -1,6 +1,11 @@
 from urllib.parse import quote
 
+import requests
 from curl_cffi import requests as curl_requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 
 class LuckMailTokenClient:
@@ -41,13 +46,26 @@ class LuckMailTokenClient:
     def _request(self, endpoint, mailbox_token):
         token = self._validate_mailbox_token(mailbox_token)
         url = f"{self.base_url}/api/v1/openapi/email/token/{quote(token, safe='')}/{endpoint}"
-        r = curl_requests.get(
-            url,
-            headers=self._headers(),
-            impersonate="chrome",
-            timeout=self.timeout,
-            verify=self.verify_tls,
-        )
+        try:
+            r = curl_requests.get(
+                url,
+                headers=self._headers(),
+                impersonate="chrome",
+                timeout=self.timeout,
+                verify=self.verify_tls,
+            )
+        except Exception as curl_error:
+            try:
+                r = requests.get(
+                    url,
+                    headers=self._headers(),
+                    timeout=self.timeout,
+                    verify=self.verify_tls,
+                )
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    f"LuckMail token request failed: curl={curl_error}; fallback={fallback_error}"
+                ) from fallback_error
         try:
             body = r.json()
         except Exception:

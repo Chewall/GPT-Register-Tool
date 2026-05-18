@@ -8,5 +8,9 @@
     <AssemblyName>SmsWorkbench</AssemblyName>
     <RootNamespace>SmsWorkbench</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\app-icon.ico</ApplicationIcon>
   </PropertyGroup>
+  <ItemGroup>
+    <Resource Include="Assets\app-icon.ico" />
+  </ItemGroup>
 </Project>

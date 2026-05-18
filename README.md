@@ -5,9 +5,10 @@
 ## 环境准备
 
 ```bash
-pip install curl_cffi playwright requests
-playwright install chromium
+pip install curl_cffi cloakbrowser requests
 ```
+
+CloakBrowser 首次运行时会自动下载 Chromium 二进制文件（约200MB），无需手动安装。
 
 ## 项目结构
 

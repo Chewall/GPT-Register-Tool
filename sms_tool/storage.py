@@ -11,6 +11,7 @@ from .paths import project_path, runtime_file
 EXTRA_COLUMNS = {
     "paypal_status": "TEXT DEFAULT ''",
     "paypal_updated_at": "INTEGER DEFAULT 0",
+    "paypal_completed_at": "INTEGER DEFAULT 0",
     "refresh_token_status": "TEXT DEFAULT ''",
     "refresh_token_updated_at": "INTEGER DEFAULT 0",
     "oauth_refresh_token": "TEXT DEFAULT ''",

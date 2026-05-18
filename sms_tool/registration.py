@@ -12,7 +12,7 @@ from .paths import runtime_file
 from .utils import _generate_password, _print_timings, _random_birthdate, _random_name, _tick, _timing_summary, _tock, _tl
 
 # ==========================================
-# Sentinel token (cached, Playwright only when needed)
+# Sentinel token (cached, browser only when needed)
 # ==========================================
 SENTINEL_CACHE_FILE = runtime_file(CFG, "sentinel_cache.json")
 
@@ -39,66 +39,65 @@ def _extract_sentinel():
     cached = _get_cached_sentinel()
     if cached: return cached
     try:
-        from playwright.sync_api import sync_playwright
+        from cloakbrowser import launch
     except ImportError:
-        print("[Error] pip install playwright && playwright install chromium")
+        print("[Error] pip install cloakbrowser")
         return None
 
     auth_base = CFG["chatgpt"].get("auth_base_url", "https://auth.openai.com")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
-        ctx = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/148.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}, locale="en-US", timezone_id="America/New_York")
-        page = ctx.new_page()
+    browser = launch(headless=True, humanize=True)
+    ctx = browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/148.0.0.0 Safari/537.36",
+        viewport={"width": 1280, "height": 800}, locale="en-US", timezone_id="America/New_York")
+    page = ctx.new_page()
 
-        device_id = str(uuid.uuid4())
-        state_val = secrets.token_urlsafe(32)
-        scope = "openid email profile offline_access model.request model.read organization.read organization.write"
-        auth_url = (
-            f"{auth_base}/api/accounts/authorize"
-            f"?client_id={CFG['chatgpt']['chat_web_client_id']}"
-            f"&scope={quote(scope)}"
-            f"&response_type=code"
-            f"&redirect_uri={quote('https://chatgpt.com/api/auth/callback/openai')}"
-            f"&audience={quote('https://api.openai.com/v1')}"
-            f"&device_id={device_id}"
-            f"&prompt=login"
-            f"&screen_hint=signup"
-            f"&state={state_val}"
-        )
-        try: page.goto(auth_url, wait_until="domcontentloaded", timeout=120000)
-        except: page.goto(auth_url, wait_until="commit", timeout=120000)
+    device_id = str(uuid.uuid4())
+    state_val = secrets.token_urlsafe(32)
+    scope = "openid email profile offline_access model.request model.read organization.read organization.write"
+    auth_url = (
+        f"{auth_base}/api/accounts/authorize"
+        f"?client_id={CFG['chatgpt']['chat_web_client_id']}"
+        f"&scope={quote(scope)}"
+        f"&response_type=code"
+        f"&redirect_uri={quote('https://chatgpt.com/api/auth/callback/openai')}"
+        f"&audience={quote('https://api.openai.com/v1')}"
+        f"&device_id={device_id}"
+        f"&prompt=login"
+        f"&screen_hint=signup"
+        f"&state={state_val}"
+    )
+    try: page.goto(auth_url, wait_until="domcontentloaded", timeout=120000)
+    except: page.goto(auth_url, wait_until="commit", timeout=120000)
 
-        try:
-            page.wait_for_function("() => typeof window.SentinelSDK !== 'undefined'", timeout=60000, polling=500)
-            print("  SentinelSDK loaded")
-        except Exception:
-            print("  SentinelSDK not loaded!"); browser.close(); return None
+    try:
+        page.wait_for_function("() => typeof window.SentinelSDK !== 'undefined'", timeout=60000, polling=500)
+        print("  SentinelSDK loaded")
+    except Exception:
+        print("  SentinelSDK not loaded!"); browser.close(); return None
 
-        page.evaluate("() => SentinelSDK.init()"); time.sleep(0.5)
-        did = page.evaluate("() => document.cookie.match(/oai-did=([^;]+)/)?.[1] || ''")
+    page.evaluate("() => SentinelSDK.init()"); time.sleep(0.5)
+    did = page.evaluate("() => document.cookie.match(/oai-did=([^;]+)/)?.[1] || ''")
 
-        sentinel_token = page.evaluate(f"""(did) => {{
-            return SentinelSDK.token().then(raw => {{
-                const parsed = JSON.parse(raw);
-                parsed.id = did;
-                parsed.flow = 'username_password_create';
-                return JSON.stringify(parsed);
+    sentinel_token = page.evaluate(f"""(did) => {{
+        return SentinelSDK.token().then(raw => {{
+            const parsed = JSON.parse(raw);
+            parsed.id = did;
+            parsed.flow = 'username_password_create';
+            return JSON.stringify(parsed);
+        }});
+    }}""", did)
+
+    sentinel_so = page.evaluate(f"""(did) => {{
+        return SentinelSDK.token().then(raw => {{
+            const parsed = JSON.parse(raw);
+            return JSON.stringify({{
+                so: raw, c: parsed.c, id: did, flow: 'oauth_create_account'
             }});
-        }}""", did)
+        }});
+    }}""", did)
 
-        sentinel_so = page.evaluate(f"""(did) => {{
-            return SentinelSDK.token().then(raw => {{
-                const parsed = JSON.parse(raw);
-                return JSON.stringify({{
-                    so: raw, c: parsed.c, id: did, flow: 'oauth_create_account'
-                }});
-            }});
-        }}""", did)
-
-        cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in ctx.cookies())
-        browser.close()
+    cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in ctx.cookies())
+    browser.close()
 
     result = {
         "sentinel_token": sentinel_token,
@@ -177,20 +176,55 @@ def _cookie_header(session):
         items = cookies.get_dict().items()
     else:
         items = [(cookie.name, cookie.value) for cookie in cookies]
-    return "; ".join(f"{name}={value}" for name, value in items)
+    return _minimal_chatgpt_cookie_header("; ".join(f"{name}={value}" for name, value in items))
 
 
-def _fetch_auth_session(session, chat_base, base_headers):
-    r = session.get(f"{chat_base}/api/auth/session",
-        headers={**base_headers, "Accept": "application/json", "Origin": chat_base, "Referer": f"{chat_base}/"},
-        impersonate="chrome", timeout=30)
-    body = _json_or_raw(r, limit=1000)
-    print(f"  Auth session: {r.status_code}")
-    return {
-        "status_code": r.status_code,
-        "body": body,
-        "cookie_header": _cookie_header(session),
+def _minimal_chatgpt_cookie_header(cookie_header):
+    keep = {
+        "__Host-next-auth.csrf-token",
+        "__Secure-next-auth.callback-url",
+        "__Secure-next-auth.session-token",
     }
+    output = []
+    for item in str(cookie_header or "").split(";"):
+        item = item.strip()
+        if "=" not in item:
+            continue
+        name, value = item.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if name in keep and value:
+            output.append(f"{name}={value}")
+    return "; ".join(output)
+
+
+def _auth_session_access_token(body):
+    return (
+        body.get("accessToken")
+        or body.get("access_token")
+        or _extract_nested(body, "session", "access_token")
+        or _extract_nested(body, "session", "accessToken")
+    )
+
+
+def _fetch_auth_session(session, chat_base, base_headers, attempts=6, delay=2.0):
+    last = {"status_code": 0, "body": {}, "cookie_header": _cookie_header(session)}
+    for attempt in range(1, max(1, int(attempts or 1)) + 1):
+        r = session.get(f"{chat_base}/api/auth/session",
+            headers={**base_headers, "Accept": "application/json", "Origin": chat_base, "Referer": f"{chat_base}/"},
+            impersonate="chrome", timeout=30)
+        body = _json_or_raw(r, limit=1000)
+        last = {
+            "status_code": r.status_code,
+            "body": body,
+            "cookie_header": _cookie_header(session),
+        }
+        print(f"  Auth session: {r.status_code}" + (f" attempt={attempt}" if attempt > 1 else ""))
+        if r.status_code == 200 and _auth_session_access_token(body):
+            return last
+        if attempt < attempts:
+            time.sleep(delay)
+    return last
 
 
 def _extract_query_param(url, key):
@@ -372,11 +406,7 @@ def run_email(proxy=None, password=None, sentinel_data=None, mailbox=None, paypa
     auth_session = _fetch_auth_session(session, chat_base, base_headers)
     _tock()
     auth_body = auth_session.get("body") or {}
-    access_token = (
-        auth_body.get("accessToken")
-        or auth_body.get("access_token")
-        or _extract_nested(auth_body, "session", "access_token")
-    )
+    access_token = _auth_session_access_token(auth_body)
 
     paypal = {}
     if r.status_code == 200 and access_token and paypal_link:
