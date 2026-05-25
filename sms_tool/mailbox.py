@@ -564,6 +564,21 @@ def _message_received_ts(msg):
         return 0
 
 
+def _message_sender(msg):
+    try:
+        if not isinstance(msg, dict):
+            return ""
+        from_field = msg.get("from")
+        if not isinstance(from_field, dict):
+            return ""
+        email_addr = from_field.get("emailAddress")
+        if not isinstance(email_addr, dict):
+            return ""
+        return str(email_addr.get("address", "")).lower()
+    except Exception:
+        return ""
+
+
 def _email_otp_candidate(mailbox, msg, keyword="", issued_after_unix=0):
     if issued_after_unix > 0:
         recv_ts = _message_received_ts(msg)
@@ -579,6 +594,9 @@ def _email_otp_candidate(mailbox, msg, keyword="", issued_after_unix=0):
     body += str((((msg or {}).get("body") or {}).get("content")) or "")
     otp = _extract_otp_from_text(body)
     if not otp:
+        return None
+    sender = _message_sender(msg)
+    if sender and "openai.com" not in sender:
         return None
     return {
         "otp": otp,
@@ -653,7 +671,9 @@ def _poll_email_otp(mailbox, subject_keyword="", timeout=300, issued_after_unix=
             for msg in _fetch_mailbox_messages(mailbox, proxy=proxy):
                 candidate = _email_otp_candidate(mailbox, msg, keyword=keyword, issued_after_unix=issued_after_unix)
                 if candidate:
-                    print(f" code:{candidate['otp']}!")
+                    sender = _message_sender(msg)
+                    subj = str((msg or {}).get("subject", "") if isinstance(msg, dict) else "")
+                    print(f" code:{candidate['otp']}! from:{sender or '?'} subj:{subj[:50]}")
                     return candidate["otp"]
         except Exception as e:
             print(f"[mailbox poll error: {e}]")
